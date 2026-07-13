@@ -22,7 +22,7 @@ lr_drop_list = [33, 45]
 
 modelname = 'dino'
 frozen_weights = None
-backbone = 'resnet50'
+backbone = 'swin_L_384_22k'
 use_checkpoint = False
 
 dilation = False
