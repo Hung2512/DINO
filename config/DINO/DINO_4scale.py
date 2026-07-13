@@ -1,6 +1,6 @@
 _base_ = ['coco_transformer.py']
 
-num_classes=91
+num_classes=3
 
 lr = 0.0001
 param_dict_type = 'default'
@@ -11,7 +11,7 @@ lr_linear_proj_mult = 0.1
 ddetr_lr_param = False
 batch_size = 2
 weight_decay = 0.0001
-epochs = 12
+epochs = 50
 lr_drop = 11
 save_checkpoint_interval = 1
 clip_max_norm = 0.1
@@ -39,7 +39,7 @@ dim_feedforward = 2048
 hidden_dim = 256
 dropout = 0.0
 nheads = 8
-num_queries = 900
+num_queries = 20
 query_dim = 4
 num_patterns = 0
 pdetr3_bbox_embed_diff_each_layer = False
@@ -68,7 +68,7 @@ two_stage_class_embed_share = False
 two_stage_learn_wh = False
 two_stage_default_hw = 0.05
 two_stage_keep_all_tokens = False
-num_select = 300
+num_select = 50
 transformer_activation = 'relu'
 batch_norm_type = 'FrozenBatchNorm2d'
 masks = False
@@ -80,7 +80,7 @@ cls_loss_coef = 1.0
 mask_loss_coef = 1.0
 dice_loss_coef = 1.0
 bbox_loss_coef = 5.0
-giou_loss_coef = 2.0
+giou_loss_coef = 3.0
 enc_loss_coef = 1.0
 interm_loss_coef = 1.0
 no_interm_box_loss = False
@@ -96,11 +96,11 @@ dec_pred_class_embed_share = True
 
 # for dn
 use_dn = True
-dn_number = 100
+dn_number = 20
 dn_box_noise_scale = 0.4
 dn_label_noise_ratio = 0.5
 embed_init_tgt = True
-dn_labelbook_size = 91
+dn_labelbook_size = 3
 
 match_unstable_error = True
 
@@ -110,4 +110,3 @@ ema_decay = 0.9997
 ema_epoch = 0
 
 use_detached_boxes_dec_out = False
-

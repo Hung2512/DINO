@@ -38,4 +38,3 @@ ms_deform_attn_cpu_backward(
 {
     AT_ERROR("Not implement on cpu");
 }
-

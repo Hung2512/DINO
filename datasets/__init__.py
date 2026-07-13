@@ -3,12 +3,13 @@ import torch.utils.data
 import torchvision
 
 from .coco import build as build_coco
+from .thyroid import build as build_thyroid  # [NEW] Import module build_thyroid
 
 
 def get_coco_api_from_dataset(dataset):
     for _ in range(10):
         # if isinstance(dataset, torchvision.datasets.CocoDetection):
-        #     break
+        #      break
         if isinstance(dataset, torch.utils.data.Subset):
             dataset = dataset.dataset
     if isinstance(dataset, torchvision.datasets.CocoDetection):
@@ -28,4 +29,6 @@ def build_dataset(image_set, args):
     if args.dataset_file == 'vanke':
         from .vanke import build_vanke
         return build_vanke(image_set, args)
+    if args.dataset_file == 'thyroid':       # [NEW] Rẽ nhánh xử lý cho thyroid dataset
+        return build_thyroid(image_set, args) 
     raise ValueError(f'dataset {args.dataset_file} not supported')

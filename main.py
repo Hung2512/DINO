@@ -9,6 +9,8 @@ from pathlib import Path
 import os, sys
 import numpy as np
 
+np.float = float
+
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -71,6 +73,11 @@ def get_args_parser():
     parser.add_argument("--local_rank", type=int, help='local rank for DistributedDataParallel')
     parser.add_argument('--amp', action='store_true',
                         help="Train with mixed precision")
+
+    parser.add_argument('--data_path', type=str, default='data/thyroid_data')
+    parser.add_argument('--brighness_levels', type=int, default=5)
+    parser.add_argument('--iou_thrs_list', type=str, default='0.3,0.5')
+    parser.add_argument('--cache_mode', action='store_true', help='cache images in memory')
     
     return parser
 
@@ -165,7 +172,8 @@ def main(args):
     
 
     dataset_train = build_dataset(image_set='train', args=args)
-    dataset_val = build_dataset(image_set='val', args=args)
+    eval_split = 'test' if args.test else 'val'
+    dataset_val = build_dataset(image_set=eval_split, args=args)
 
     if args.distributed:
         sampler_train = DistributedSampler(dataset_train)
@@ -192,13 +200,13 @@ def main(args):
 
     if args.dataset_file == "coco_panoptic":
         # We also evaluate AP during panoptic training, on original coco DS
-        coco_val = datasets.coco.build("val", args)
+        coco_val = datasets.coco.build(eval_split, args)
         base_ds = get_coco_api_from_dataset(coco_val)
     else:
         base_ds = get_coco_api_from_dataset(dataset_val)
 
     if args.frozen_weights is not None:
-        checkpoint = torch.load(args.frozen_weights, map_location='cpu')
+        checkpoint = torch.load(args.frozen_weights, map_location='cpu', weights_only=False)
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
     output_dir = Path(args.output_dir)
@@ -209,7 +217,7 @@ def main(args):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         model_without_ddp.load_state_dict(checkpoint['model'])
         if args.use_ema:
             if 'ema_model' in checkpoint:
@@ -224,7 +232,7 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
 
     if (not args.resume) and args.pretrain_model_path:
-        checkpoint = torch.load(args.pretrain_model_path, map_location='cpu')['model']
+        checkpoint = torch.load(args.pretrain_model_path, map_location='cpu', weights_only=False)['model']
         from collections import OrderedDict
         _ignorekeywordlist = args.finetune_ignore if args.finetune_ignore else []
         ignorelist = []
@@ -254,10 +262,18 @@ def main(args):
         os.environ['EVAL_FLAG'] = 'TRUE'
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
                                               data_loader_val, base_ds, device, args.output_dir, wo_class_error=wo_class_error, args=args)
-        if args.output_dir:
-            utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
+        
+        print(f"Evaluation Results:")
+        print(f" - thyroid_mAP@.5: {test_stats.get('thyroid_mAP@.5', 0.0):.4f}")
+        print(f" - shoulder_mAP@.3: {test_stats.get('shoulder_mAP@.3', 0.0):.4f}")
+        print(f" - rsi_acc: {test_stats.get('rsi_acc', 0.0):.4f}")
 
-        log_stats = {**{f'test_{k}': v for k, v in test_stats.items()} }
+        if args.output_dir:
+            save_name = "eval_test.pth" if args.test else "eval.pth"
+            utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / save_name)
+
+        prefix = 'test' if args.test else 'val'
+        log_stats = {**{f'{prefix}_{k}': v for k, v in test_stats.items()} }
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
@@ -266,6 +282,7 @@ def main(args):
 
     print("Start training")
     start_time = time.time()
+    best = -np.inf
     best_map_holder = BestMetricHolder(use_ema=args.use_ema)
     for epoch in range(args.start_epoch, args.epochs):
         epoch_start_time = time.time()
@@ -303,6 +320,29 @@ def main(args):
             model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
             wo_class_error=wo_class_error, args=args, logger=(logger if args.save_log else None)
         )
+        
+        print(f"Epoch [{epoch}] Evaluation Results:")
+        print(f" - thyroid_mAP@.5: {test_stats.get('thyroid_mAP@.5', 0.0):.4f}")
+        print(f" - shoulder_mAP@.3: {test_stats.get('shoulder_mAP@.3', 0.0):.4f}")
+        print(f" - rsi_acc: {test_stats.get('rsi_acc', 0.0):.4f}")
+        
+        current = (test_stats.get('thyroid_mAP@.5', 0.0) * 0.6
+                   + test_stats.get('rsi_acc', 0.0) * 0.3
+                   + test_stats.get('shoulder_mAP@.3', 0.0) * 0.1)
+        
+        print(current)
+                    
+        if current > best:
+            utils.save_on_master({
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'epoch': epoch,
+                'args': args,
+            }, output_dir / 'best.pth')
+            best = current
+            print("Current best evaluation error: ", best)
+
         map_regular = test_stats['coco_eval_bbox'][0]
         _isbest = best_map_holder.update(map_regular, epoch, is_ema=False)
         if _isbest:

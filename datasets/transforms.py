@@ -13,6 +13,13 @@ from util.box_ops import box_xyxy_to_cxcywh
 from util.misc import interpolate
 
 
+def get_image_size(img):
+    if isinstance(img, torch.Tensor):
+        return img.shape[-1], img.shape[-2] # w, h
+    else:
+        return img.size
+
+
 def crop(image, target, region):
     cropped_image = F.crop(image, *region)
 
@@ -60,7 +67,7 @@ def crop(image, target, region):
 def hflip(image, target):
     flipped_image = F.hflip(image)
 
-    w, h = image.size
+    w, h = get_image_size(image)
 
     target = target.copy()
     if "boxes" in target:
@@ -103,13 +110,13 @@ def resize(image, target, size, max_size=None):
         else:
             return get_size_with_aspect_ratio(image_size, size, max_size)
 
-    size = get_size(image.size, size, max_size)
+    size = get_size(get_image_size(image), size, max_size)
     rescaled_image = F.resize(image, size)
 
     if target is None:
         return rescaled_image, None
 
-    ratios = tuple(float(s) / float(s_orig) for s, s_orig in zip(rescaled_image.size, image.size))
+    ratios = tuple(float(s) / float(s_orig) for s, s_orig in zip(get_image_size(rescaled_image), get_image_size(image)))
     ratio_width, ratio_height = ratios
 
     target = target.copy()
@@ -140,7 +147,7 @@ def pad(image, target, padding):
         return padded_image, None
     target = target.copy()
     # should we do something wrt the original size?
-    target["size"] = torch.tensor(padded_image.size[::-1])
+    target["size"] = torch.tensor(get_image_size(padded_image)[::-1])
     if "masks" in target:
         target['masks'] = torch.nn.functional.pad(target['masks'], (0, padding[0], 0, padding[1]))
     return padded_image, target
@@ -169,8 +176,9 @@ class RandomSizeCrop(object):
         self.max_size = max_size
 
     def __call__(self, img: PIL.Image.Image, target: dict):
-        w = random.randint(self.min_size, min(img.width, self.max_size))
-        h = random.randint(self.min_size, min(img.height, self.max_size))
+        img_w, img_h = get_image_size(img)
+        w = random.randint(self.min_size, min(img_w, self.max_size))
+        h = random.randint(self.min_size, min(img_h, self.max_size))
         region = T.RandomCrop.get_params(img, [h, w])
         return crop(img, target, region)
 
@@ -180,7 +188,7 @@ class CenterCrop(object):
         self.size = size
 
     def __call__(self, img, target):
-        image_width, image_height = img.size
+        image_width, image_height = get_image_size(img)
         crop_height, crop_width = self.size
         crop_top = int(round((image_height - crop_height) / 2.))
         crop_left = int(round((image_width - crop_width) / 2.))
