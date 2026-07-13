@@ -214,20 +214,40 @@ def build_backbone(args):
     # [NEW] --- Inject custom Conv1 channel size ---
     if hasattr(args, 'brighness_levels') and args.brighness_levels != 3:
         # Ghi đè layer conv1 để nhận số lượng channel tương ứng với brighness_levels thay vì chuẩn 3 channels
-        old_conv = backbone.body.conv1
-        new_conv = torch.nn.Conv2d(args.brighness_levels, old_conv.out_channels, 
-                                   kernel_size=old_conv.kernel_size, stride=old_conv.stride, 
-                                   padding=old_conv.padding, bias=False)
+        if hasattr(backbone, 'body') and hasattr(backbone.body, 'conv1'):
+            old_conv = backbone.body.conv1
+        elif hasattr(backbone, 'patch_embed') and hasattr(backbone.patch_embed, 'proj'):
+            old_conv = backbone.patch_embed.proj
+        elif hasattr(backbone, 'downsample_layers') and len(backbone.downsample_layers) > 0:
+            old_conv = backbone.downsample_layers[0][0]
+        else:
+            raise NotImplementedError(f"Cannot find first conv layer for backbone {args.backbone}")
+
+        new_conv = torch.nn.Conv2d(
+            args.brighness_levels, 
+            old_conv.out_channels, 
+            kernel_size=old_conv.kernel_size, 
+            stride=old_conv.stride, 
+            padding=old_conv.padding, 
+            bias=getattr(old_conv, 'bias', None) is not None
+        )
         
         # Chuyển đổi và tái sử dụng pretrained weights (Trung bình hoá theo channel)
         with torch.no_grad():
-            pretrained_weight = old_conv.weight.data # Shape: [64, 3, 7, 7]
+            pretrained_weight = old_conv.weight.data # Shape: [out_channels, 3, k, k]
             # Lấy trung bình 3 kênh RGB để tạo thành 1 kênh "grayscale"
-            gray_weight = pretrained_weight.mean(dim=1, keepdim=True) # Shape: [64, 1, 7, 7]
+            gray_weight = pretrained_weight.mean(dim=1, keepdim=True) # Shape: [out_channels, 1, k, k]
             # Nhân bản ra số lượng channels tương ứng với brighness_levels
-            new_conv.weight.data = gray_weight.repeat(1, args.brighness_levels, 1, 1) # Shape: [64, brighness_levels, 7, 7]
+            new_conv.weight.copy_(gray_weight.repeat(1, args.brighness_levels, 1, 1))
+            if old_conv.bias is not None:
+                new_conv.bias.copy_(old_conv.bias.data)
         
-        backbone.body.conv1 = new_conv
+        if hasattr(backbone, 'body') and hasattr(backbone.body, 'conv1'):
+            backbone.body.conv1 = new_conv
+        elif hasattr(backbone, 'patch_embed') and hasattr(backbone.patch_embed, 'proj'):
+            backbone.patch_embed.proj = new_conv
+        elif hasattr(backbone, 'downsample_layers') and len(backbone.downsample_layers) > 0:
+            backbone.downsample_layers[0][0] = new_conv
 
     model = Joiner(backbone, position_embedding)
     model.num_channels = bb_num_channels 
