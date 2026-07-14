@@ -201,7 +201,7 @@ def truncate_bbox(bbox, h, w):
     bbox[3] = bbox[3] if bbox[3] < h else h - 1
     return bbox
 
-def cal_uptake(img, bbox, normalize=True):
+def cal_uptake(img, bbox, normalize=False):
     """Sum (or mean) pixel counts inside the ellipse inscribed in `bbox`.
 
     normalize=True (default) returns the MEAN count per pixel instead of the raw SUM.
