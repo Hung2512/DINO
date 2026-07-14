@@ -76,7 +76,7 @@ class RandomBoxPerturber():
         return new_refanchors.clamp_(0, 1)
 
 
-def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
+def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2, class_weight=None):
     """
     Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
     Args:
@@ -89,6 +89,10 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
                 positive vs negative examples. Default = -1 (no weighting).
         gamma: Exponent of the modulating factor (1 - p_t) to
                balance easy vs hard examples.
+        class_weight: (optional) 1D tensor of shape [num_classes], broadcast over the last
+                dim of `inputs`/`targets`. Lets a rare / weak-signal class (e.g. "shoulder")
+                contribute proportionally more to the loss than an unweighted setup would.
+                Default = None (no per-class weighting, identical to original behaviour).
     Returns:
         Loss tensor
     """
@@ -100,6 +104,10 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
     if alpha >= 0:
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
+
+    if class_weight is not None:
+        # class_weight: [C] -> broadcasts over [B, Q, C]
+        loss = loss * class_weight.to(dtype=loss.dtype, device=loss.device)
 
     return loss.mean(1).sum() / num_boxes
 

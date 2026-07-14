@@ -19,7 +19,7 @@ from typing import List
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torchvision.ops.boxes import nms
+from torchvision.ops.boxes import nms, batched_nms
 
 from util import box_ops
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
@@ -336,7 +336,7 @@ class SetCriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, losses):
+    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, losses, class_weight=None):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -344,6 +344,9 @@ class SetCriterion(nn.Module):
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
             losses: list of all the losses to be applied. See get_loss for list of available losses.
             focal_alpha: alpha in Focal Loss
+            class_weight: optional list/tensor of length num_classes giving a per-class multiplier
+                for the classification loss (e.g. up-weight a rare/weak-signal class like "shoulder"
+                relative to a visually salient one like "thyroid"). Default None = no weighting.
         """
         super().__init__()
         self.num_classes = num_classes
@@ -351,6 +354,11 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.losses = losses
         self.focal_alpha = focal_alpha
+        if class_weight is not None:
+            class_weight = torch.as_tensor(class_weight, dtype=torch.float32)
+            assert class_weight.numel() == num_classes, \
+                f"class_weight must have {num_classes} entries, got {class_weight.numel()}"
+        self.register_buffer('class_weight', class_weight, persistent=False)
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss)
@@ -370,7 +378,8 @@ class SetCriterion(nn.Module):
         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
 
         target_classes_onehot = target_classes_onehot[:,:,:-1]
-        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2,
+                                     class_weight=self.class_weight) * src_logits.shape[1]
         losses = {'loss_ce': loss_ce}
 
         if log:
@@ -638,10 +647,25 @@ class SetCriterion(nn.Module):
 
 class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
-    def __init__(self, num_select=100, nms_iou_threshold=-1) -> None:
+    def __init__(self, num_select=100, nms_iou_threshold=-1, class_agnostic=True) -> None:
+        """
+        Args:
+            num_select: budget of boxes to keep.
+                - class_agnostic=True (original behaviour): top-`num_select` (query, class)
+                  pairs ranked globally over the flattened score matrix. With few queries/classes
+                  (small custom datasets) this barely filters anything and lets a visually salient
+                  class crowd out a weak-signal one.
+                - class_agnostic=False: top-`num_select` boxes are kept *per class independently*,
+                  so every class gets a guaranteed budget regardless of how confident/dominant
+                  other classes are.
+            nms_iou_threshold: if > 0, apply NMS before returning results.
+            class_agnostic: selection/NMS mode, see above. NMS itself is always done classwise
+                (via batched_nms) so boxes of different classes never suppress each other.
+        """
         super().__init__()
         self.num_select = num_select
         self.nms_iou_threshold = nms_iou_threshold
+        self.class_agnostic = class_agnostic
 
     @torch.no_grad()
     def forward(self, outputs, target_sizes, not_to_xyxy=False, test=False):
@@ -659,10 +683,8 @@ class PostProcess(nn.Module):
         assert target_sizes.shape[1] == 2
 
         prob = out_logits.sigmoid()
-        topk_values, topk_indexes = torch.topk(prob.view(out_logits.shape[0], -1), num_select, dim=1)
-        scores = topk_values
-        topk_boxes = topk_indexes // out_logits.shape[2]
-        labels = topk_indexes % out_logits.shape[2]
+        num_classes = out_logits.shape[2]
+
         if not_to_xyxy:
             boxes = out_bbox
         else:
@@ -671,21 +693,59 @@ class PostProcess(nn.Module):
         if test:
             assert not not_to_xyxy
             boxes[:,:,2:] = boxes[:,:,2:] - boxes[:,:,:2]
-        boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1,1,4))
-        
+
         # and from relative [0, 1] to absolute [0, height] coordinates
         img_h, img_w = target_sizes.unbind(1)
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         boxes = boxes * scale_fct[:, None, :]
 
-        if self.nms_iou_threshold > 0:
-            item_indices = [nms(b, s, iou_threshold=self.nms_iou_threshold) for b,s in zip(boxes, scores)]
-
-            results = [{'scores': s[i], 'labels': l[i], 'boxes': b[i]} for s, l, b, i in zip(scores, labels, boxes, item_indices)]
+        if self.class_agnostic:
+            # Original behaviour: rank all (query, class) pairs together.
+            topk_values, topk_indexes = torch.topk(prob.view(out_logits.shape[0], -1), num_select, dim=1)
+            scores = topk_values
+            topk_boxes = topk_indexes // num_classes
+            labels = topk_indexes % num_classes
+            sel_boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
+            scores_list = list(scores)
+            labels_list = list(labels)
+            boxes_list = list(sel_boxes)
         else:
-            results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
+            # Class-aware selection: guarantee `num_select` candidates for every class so a
+            # visually dominant class (e.g. thyroid hotspot) cannot crowd out a weak-signal one
+            # (e.g. shoulder) out of the ranked list.
+            k = min(num_select, prob.shape[1])
+            scores_list, labels_list, boxes_list = [], [], []
+            for b in range(prob.shape[0]):
+                cls_scores, cls_labels, cls_boxes = [], [], []
+                for c in range(num_classes):
+                    top_vals, top_idx = torch.topk(prob[b, :, c], k)
+                    cls_scores.append(top_vals)
+                    cls_labels.append(torch.full_like(top_idx, c))
+                    cls_boxes.append(boxes[b, top_idx])
+                scores_list.append(torch.cat(cls_scores))
+                labels_list.append(torch.cat(cls_labels))
+                boxes_list.append(torch.cat(cls_boxes))
 
-        return results
+        if self.nms_iou_threshold > 0:
+            # batched_nms suppresses only within the same class, so a shoulder box never gets
+            # removed because it overlaps a thyroid box (or vice versa).
+            item_indices = [batched_nms(b, s, l, iou_threshold=self.nms_iou_threshold)
+                            for b, s, l in zip(boxes_list, scores_list, labels_list)]
+            results = [{'scores': s[i], 'labels': l[i], 'boxes': b[i]}
+                      for s, l, b, i in zip(scores_list, labels_list, boxes_list, item_indices)]
+        else:
+            results = [{'scores': s, 'labels': l, 'boxes': b}
+                      for s, l, b in zip(scores_list, labels_list, boxes_list)]
+
+        # Always return results sorted by score descending, so downstream code that relies on
+        # "the first N entries per class are the highest-confidence ones" (e.g. RSI's top_k
+        # selection) behaves consistently regardless of class_agnostic/NMS settings.
+        sorted_results = []
+        for r in results:
+            order = r['scores'].argsort(descending=True)
+            sorted_results.append({k: v[order] for k, v in r.items()})
+
+        return sorted_results
 
 
 @MODULE_BUILD_FUNCS.registe_with_name(module_name='dino')
@@ -805,11 +865,25 @@ def build_dino(args):
     losses = ['labels', 'boxes', 'cardinality']
     if args.masks:
         losses += ["masks"]
+
+    try:
+        class_loss_weight = args.class_loss_weight
+    except:
+        class_loss_weight = None
+
     criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
                              focal_alpha=args.focal_alpha, losses=losses,
+                             class_weight=class_loss_weight,
                              )
     criterion.to(device)
-    postprocessors = {'bbox': PostProcess(num_select=args.num_select, nms_iou_threshold=args.nms_iou_threshold)}
+
+    try:
+        class_agnostic_select = args.class_agnostic_select
+    except:
+        class_agnostic_select = True
+
+    postprocessors = {'bbox': PostProcess(num_select=args.num_select, nms_iou_threshold=args.nms_iou_threshold,
+                                          class_agnostic=class_agnostic_select)}
     if args.masks:
         postprocessors['segm'] = PostProcessSegm()
         if args.dataset_file == "coco_panoptic":

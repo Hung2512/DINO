@@ -201,7 +201,20 @@ def truncate_bbox(bbox, h, w):
     bbox[3] = bbox[3] if bbox[3] < h else h - 1
     return bbox
 
-def cal_uptake(img, bbox):
+def cal_uptake(img, bbox, normalize=True):
+    """Sum (or mean) pixel counts inside the ellipse inscribed in `bbox`.
+
+    normalize=True (default) returns the MEAN count per pixel instead of the raw SUM.
+    Rationale: a raw sum scales with the area of the predicted box, so two boxes around the
+    same true ROI but with slightly different width/height (e.g. still passing IoU>=0.3, which
+    is a fairly loose match) can yield very different "uptake" values and therefore a very
+    different RSI ratio, even though they localize the same region reasonably well. Averaging
+    over the enclosed area removes that scale-dependence and makes the resulting RSI much less
+    sensitive to small differences in predicted box size/position, which matters because RSI
+    accuracy (calc_rsi_acc) only trusts the single highest-confidence box per class.
+
+    normalize=False reproduces the original raw-sum behaviour.
+    """
     # bbox = [int(x) for x in bbox]
     bbox = truncate_bbox(bbox, *img.shape[:2])
     a = (bbox[2] - bbox[0]) / 2
@@ -209,12 +222,18 @@ def cal_uptake(img, bbox):
     # area = a * b * 4
     c_x = (bbox[0] + bbox[2]) / 2
     c_y = (bbox[1] + bbox[3]) /2
-    
+
     x = list(range(img.shape[1]))
     y = list(range(img.shape[0]))
     xx, yy = np.meshgrid(x, y)
-    
-    uptake = np.sum(img[((xx - c_x)**2 / (a**2) + (yy - c_y)**2 / (b**2)) <= 1])
+
+    mask = ((xx - c_x)**2 / (a**2 + 1e-8) + (yy - c_y)**2 / (b**2 + 1e-8)) <= 1
+    roi_pixels = img[mask]
+    if roi_pixels.size == 0:
+        print('EMPTY ROI for bbox:', bbox)
+        return 0.0
+
+    uptake = roi_pixels.mean() if normalize else roi_pixels.sum()
     if uptake == 0:
         print(bbox)
     # ROI = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
